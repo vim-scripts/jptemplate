@@ -2,7 +2,7 @@
 "
 " A simple yet powerful interactive templating system for VIM.
 "
-" Version 1.3 (released 2008-07-01).
+" Version 1.4 (released 2008-07-07).
 "
 " Copyright (c) 2008 Jannis Pohlmann <jannis@xfce.org>.
 "
@@ -23,7 +23,13 @@
 
 
 " Reserved variable names
-let s:reservedVariables = ['date']
+let s:reservedVariables = ['date','shell','interactive_shell']
+
+" Variable value history
+let s:rememberedValues = {}
+
+" Characters to be escaped before the substitute() call
+let s:escapeCharacters = '&~\'
 
 
 function! jp:Initialize ()
@@ -156,9 +162,59 @@ function! jp:EvaluateReservedVariable (name, value, variables)
 
   if a:name == 'date'
     let result = strftime (empty (a:value) ? g:jpTemplateDateFormat : a:value)
+  elseif a:name == 'shell'
+    if !empty (a:value)
+      let result = system (a:value)
+    endif
+  elseif a:name == 'interactive_shell'
+    let command = input ('interactive_shell: ', a:value)
+    if !empty (command)
+      let result = system (command)
+    endif
   endif
 
   return result
+
+endfunction
+
+
+function! jp:ExpandTemplate (info, template)
+
+  " Backup content before and after the template name
+  let before = strpart (getline ('.'), 0, a:info['start'])
+  let after  = strpart (getline ('.'), a:info['end'])
+
+  " Merge lines of the template and then split them up again.
+  " This makes multi-line variable values possible
+  let mergedTemplate = split (join (a:template, "\n"), "\n")
+
+  " Define cnt as the number of inserted lines
+  let cnt = 0
+
+  " Remove template string if the resulting template is empty
+  if len (mergedTemplate) == 0
+    call setline (line ('.'), before . after)
+    call cursor (line ('.'), len (before) + 1)
+  else
+    " Insert template between before and after
+    for cnt in range (0, len (mergedTemplate) - 1)
+      if cnt == 0
+        call setline (line ('.'), before . mergedTemplate[cnt])
+      else
+        call append (line ('.') + cnt - 1, a:info['indent'] . mergedTemplate[cnt])
+      endif
+      if cnt == len (mergedTemplate) - 1
+        call setline (line ('.') + cnt, getline (line ('.') + cnt) . after)
+
+        " Move cursor to the end of the inserted template. ${cursor} may
+        " overwrite this
+        call cursor(line ('.'), len (getline (line ('.') + cnt)))
+      endif
+    endfor
+  endif
+
+  " Return number of inserted lines
+  return cnt
 
 endfunction
 
@@ -176,8 +232,8 @@ function! jp:ProcessTemplate (info, template)
   " Detect all variable names of the template
   while 1
     " Find next variable start and end position
-    let start = match    (s:str, '${[^${}]\+}', matchpos)
-    let end   = matchend (s:str, '${[^${}]\+}', matchpos)
+    let start = match    (s:str, '${[^{}]\+}', matchpos)
+    let end   = matchend (s:str, '${[^{}]\+}', matchpos)
 
     if start < 0
       " Stop search if there is no variable left
@@ -203,16 +259,21 @@ function! jp:ProcessTemplate (info, template)
           let variables[name] = ''
         endif
 
+        " Check whether local default value is defined or not
         if empty (value)
-          " Use global default if the variable value is empty
-          if empty (variables[name]) && has_key (g:jpTemplateDefaults, name)
-            let variables[name] = g:jpTemplateDefaults[name]
+          " If not, check if variable value is empty
+          if empty (variables[name])
+            " If so, either set it to the last remembered value or the global
+            " default if it exists
+            if has_key (s:rememberedValues, name)
+              let variables[name] = s:rememberedValues[name]
+            elseif has_key (g:jpTemplateDefaults, name)
+              let variables[name] = g:jpTemplateDefaults[name]
+            endif
           endif
         else
-          " Use local default (first occurence in the template only) 
-          if empty (variables[name]) || g:jpTemplateDefaults[name] == variables[name]
-            let variables[name] = value
-          endif
+          " Use local default (first occurence in the template only)
+          let variables[name] = value
         endif
       endif
 
@@ -225,6 +286,7 @@ function! jp:ProcessTemplate (info, template)
   for expr in expressions
     let [name, value] = jp:ParseExpression (expr)
     let variables[name] = input (name . ': ', variables[name])
+    let s:rememberedValues[name] = variables[name]
   endfor
 
   " Evaluate reserved variables
@@ -239,43 +301,32 @@ function! jp:ProcessTemplate (info, template)
     for expr in expressions
       let [name, value] = jp:ParseExpression (expr)
       let expr = '${' . name . '\(:[^{}]\+\)\?}'
-      let a:template[index] = substitute (a:template[index], expr, variables[name], 'g')
+      let value = escape(variables[name], s:escapeCharacters)
+      let a:template[index] = substitute (a:template[index], expr, value, 'g')
     endfor
 
     for [expr, value] in items (reserved)
       let expr = '${' . expr . '}'
+      let value = escape(value, s:escapeCharacters)
       let a:template[index] = substitute (a:template[index], expr, value, 'g')
     endfor
   endfor
 
-  " Backup content before and after the template name
-  let before = strpart (getline ('.'), 0, a:info['start'])
-  let after  = strpart (getline ('.'), a:info['end'])
-
   " Insert template into the code line by line
-  for cnt in range (0, len (a:template)-1)
-    if cnt == 0
-      call setline (line ('.'), before . a:template[cnt])
-    else
-      call append (line ('.') + cnt - 1, a:info['indent'] . a:template[cnt])
-    endif
-    if cnt == len (a:template)-1
-      call setline (line ('.') + cnt, getline (line ('.') + cnt) . after)
-
-      " Move cursor to the end of the inserted template. ${cursor} may
-      " overwrite this
-      call cursor(line ('.'), len (getline (line ('.') + cnt)))
-    endif
-  endfor
+  let insertedLines = jp:ExpandTemplate (a:info, a:template)
 
   " Set the cursor position
-  let editInCurrentLine = jp:SetCursorPosition (cnt)
+  if insertedLines > 0
+    let editInCurrentLine = jp:SetCursorPosition (insertedLines)
 
-  " Return to insert mode
-  if editInCurrentLine
-    startinsert
+    " Return to insert mode
+    if editInCurrentLine
+      startinsert
+    else
+      startinsert!
+    endif
   else
-    startinsert!
+    startinsert
   endif
 
 endfunction
